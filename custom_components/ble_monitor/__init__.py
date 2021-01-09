@@ -70,6 +70,7 @@ T_STRUCT = struct.Struct("<h")
 CND_STRUCT = struct.Struct("<H")
 ILL_STRUCT = struct.Struct("<I")
 FMDH_STRUCT = struct.Struct("<H")
+THB_STRUCT = struct.Struct(">hBB")
 
 PLATFORMS = ["binary_sensor", "sensor"]
 
@@ -407,6 +408,10 @@ class HCIdump(Thread):
         def obj0510(xobj):
             return {"switch": xobj[0], "temperature": xobj[1]}
 
+        def objATC(xobj):
+            (temp, humi, batt) = THB_STRUCT.unpack(xobj)
+            return {"temperature": temp / 10, "humidity": humi, "battery": batt}
+
         def reverse_mac(rmac):
             """Change LE order to BE."""
             if len(rmac) != 12:
@@ -473,6 +478,7 @@ class HCIdump(Thread):
             b'\x13\x10': (obj1310, False, True),
             b'\x07\x10': (obj0710, False, True),
             b'\x05\x10': (obj0510, True, True),
+            b'\x1A\x18': (objATC, False, True),
         }
 
     def process_hci_events(self, data):
@@ -566,169 +572,263 @@ class HCIdump(Thread):
         """Parse the raw data."""
         # check if packet is Extended scan result
         is_ext_packet = True if data[3] == 0x0d else False
-        # check for Xiaomi service data
+        # check for Xiaomi or ATC service data
         xiaomi_index = data.find(b'\x16\x95\xFE', 15 + 15 if is_ext_packet else 0)
-        if xiaomi_index == -1:
+        atc_index = data.find(b'\x16\x1A\x18', 15)
+        if xiaomi_index == -1 and atc_index == -1:
             return None, None, None
-        # check for no BR/EDR + LE General discoverable mode flags
-        advert_start = 29 if is_ext_packet else 14
-        adv_index = data.find(b"\x02\x01\x06", advert_start, 3 + advert_start)
-        adv_index2 = data.find(b"\x15\x16\x95", advert_start, 3 + advert_start)
-        if adv_index == -1 and adv_index2 == -1:
-            return None, None, None
-        if adv_index2 != -1:
-            adv_index = adv_index2
-        # check for BTLE msg size
-        msg_length = data[2] + 3
-        if msg_length != len(data):
-            return None, None, None
-        # check for MAC presence in message and in service data
-        xiaomi_mac_reversed = data[xiaomi_index + 8:xiaomi_index + 14]
-        mac_index = adv_index - 14 if is_ext_packet else adv_index
-        source_mac_reversed = data[mac_index - 7:mac_index - 1]
-        if xiaomi_mac_reversed != source_mac_reversed:
-            return None, None, None
-        # check for MAC presence in whitelist, if needed
-        if self.discovery is False:
-            if xiaomi_mac_reversed not in self.whitelist:
+        if xiaomi_index != -1:
+            # parse BLE message in Xiaomi MiBeacon format
+
+            # check for no BR/EDR + LE General discoverable mode flags
+            advert_start = 29 if is_ext_packet else 14
+            adv_index = data.find(b"\x02\x01\x06", advert_start, 3 + advert_start)
+            adv_index2 = data.find(b"\x15\x16\x95", advert_start, 3 + advert_start)
+            if adv_index == -1 and adv_index2 == -1:
                 return None, None, None
-        packet_id = data[xiaomi_index + 7]
-        try:
-            prev_packet = self.lpacket_ids[xiaomi_mac_reversed]
-        except KeyError:
-            prev_packet = None, None, None
-        if prev_packet == packet_id:
-            return None, None, None
-        self.lpacket_ids[xiaomi_mac_reversed] = packet_id
-        # extract RSSI byte
-        rssi_index = 18 if is_ext_packet else msg_length - 1
-        (rssi,) = struct.unpack("<b", data[rssi_index:rssi_index + 1])
-        # strange positive RSSI workaround
-        if rssi > 0:
-            rssi = -rssi
-        try:
-            sensor_type, binary_data = XIAOMI_TYPE_DICT[
-                data[xiaomi_index + 5:xiaomi_index + 7]
-            ]
-        except KeyError:
-            if self.report_unknown:
-                _LOGGER.info(
-                    "BLE ADV from UNKNOWN: RSSI: %s, MAC: %s, ADV: %s",
-                    rssi,
-                    ''.join('{:02X}'.format(x) for x in xiaomi_mac_reversed[::-1]),
-                    data.hex()
+            if adv_index2 != -1:
+                adv_index = adv_index2
+            # check for BTLE msg size
+            msg_length = data[2] + 3
+            if msg_length != len(data):
+                return None, None, None
+            # check for MAC presence in message and in service data
+            xiaomi_mac_reversed = data[xiaomi_index + 8:xiaomi_index + 14]
+            mac_index = adv_index - 14 if is_ext_packet else adv_index
+            source_mac_reversed = data[mac_index - 7:mac_index - 1]
+            if xiaomi_mac_reversed != source_mac_reversed:
+                return None, None, None
+            # check for MAC presence in whitelist, if needed
+            if self.discovery is False:
+                if xiaomi_mac_reversed not in self.whitelist:
+                    return None, None, None
+            packet_id = data[xiaomi_index + 7]
+            try:
+                prev_packet = self.lpacket_ids[xiaomi_mac_reversed]
+            except KeyError:
+                prev_packet = None, None, None
+            if prev_packet == packet_id:
+                return None, None, None
+            self.lpacket_ids[xiaomi_mac_reversed] = packet_id
+            # extract RSSI byte
+            rssi_index = 18 if is_ext_packet else msg_length - 1
+            (rssi,) = struct.unpack("<b", data[rssi_index:rssi_index + 1])
+            # strange positive RSSI workaround
+            if rssi > 0:
+                rssi = -rssi
+            try:
+                sensor_type, binary_data = XIAOMI_TYPE_DICT[
+                    data[xiaomi_index + 5:xiaomi_index + 7]
+                ]
+            except KeyError:
+                if self.report_unknown:
+                    _LOGGER.info(
+                        "BLE ADV from UNKNOWN: RSSI: %s, MAC: %s, ADV: %s",
+                        rssi,
+                        ''.join('{:02X}'.format(x) for x in xiaomi_mac_reversed[::-1]),
+                        data.hex()
+                    )
+                return None, None, None
+            # frame control bits
+            framectrl, = struct.unpack('>H', data[xiaomi_index + 3:xiaomi_index + 5])
+            # check data is present
+            if not (framectrl & 0x4000):
+                return {
+                    "rssi": rssi,
+                    "mac": ''.join('{:02X}'.format(x) for x in xiaomi_mac_reversed[::-1]),
+                    "type": sensor_type,
+                    "packet": packet_id,
+                    "data": False,
+                }, None, None
+                # return None
+            xdata_length = 0
+            xdata_point = 0
+            # check capability byte present
+            if framectrl & 0x2000:
+                xdata_length = -1
+                xdata_point = 1
+            # xiaomi data length = message length
+            #     -all bytes before XiaomiUUID
+            #     -3 bytes Xiaomi UUID + ADtype
+            #     -1 byte rssi
+            #     -3+1 bytes sensor type
+            #     -1 byte packet_id
+            #     -6 bytes MAC
+            #     - capability byte offset
+            xdata_length += msg_length - xiaomi_index - 15
+            if xdata_length < 3:
+                return None, None, None
+            xdata_point += xiaomi_index + 14
+            # check if xiaomi data start and length is valid
+            if xdata_length != len(data[xdata_point:-1]):
+                return None, None, None
+            # check encrypted data flags
+            if framectrl & 0x0800:
+                # try to find encryption key for current device
+                try:
+                    key = self.aeskeys[xiaomi_mac_reversed]
+                except KeyError:
+                    # no encryption key found
+                    return None, None, None
+                nonce = b"".join(
+                    [
+                        xiaomi_mac_reversed,
+                        data[xiaomi_index + 5:xiaomi_index + 7],
+                        data[xiaomi_index + 7:xiaomi_index + 8]
+                    ]
                 )
-            return None, None, None
-        # frame control bits
-        framectrl, = struct.unpack('>H', data[xiaomi_index + 3:xiaomi_index + 5])
-        # check data is present
-        if not (framectrl & 0x4000):
-            return {
+                endoffset = msg_length - int(not is_ext_packet)
+                encrypted_payload = data[xdata_point:endoffset]
+                aad = b"\x11"
+                token = encrypted_payload[-4:]
+                payload_counter = encrypted_payload[-7:-4]
+                nonce = b"".join([nonce, payload_counter])
+                cipherpayload = encrypted_payload[:-7]
+                cipher = AES.new(key, AES.MODE_CCM, nonce=nonce, mac_len=4)
+                cipher.update(aad)
+                decrypted_payload = None
+                try:
+                    decrypted_payload = cipher.decrypt_and_verify(cipherpayload, token)
+                except ValueError as error:
+                    _LOGGER.error("Decryption failed: %s", error)
+                    _LOGGER.error("token: %s", token.hex())
+                    _LOGGER.error("nonce: %s", nonce.hex())
+                    _LOGGER.error("encrypted_payload: %s", encrypted_payload.hex())
+                    _LOGGER.error("cipherpayload: %s", cipherpayload.hex())
+                    return None, None, None
+                if decrypted_payload is None:
+                    _LOGGER.error(
+                        "Decryption failed for %s, decrypted payload is None",
+                        "".join("{:02X}".format(x) for x in xiaomi_mac_reversed[::-1]),
+                    )
+                    return None, None, None
+                # replace cipher with decrypted data
+                msg_length -= len(encrypted_payload)
+                if is_ext_packet:
+                    data = b"".join((data[:xdata_point], decrypted_payload))
+                else:
+                    data = b"".join((data[:xdata_point], decrypted_payload, data[-1:]))
+                msg_length += len(decrypted_payload)
+            result = {
                 "rssi": rssi,
                 "mac": ''.join('{:02X}'.format(x) for x in xiaomi_mac_reversed[::-1]),
                 "type": sensor_type,
                 "packet": packet_id,
-                "data": False,
-            }, None, None
-            # return None
-        xdata_length = 0
-        xdata_point = 0
-        # check capability byte present
-        if framectrl & 0x2000:
-            xdata_length = -1
-            xdata_point = 1
-        # xiaomi data length = message length
-        #     -all bytes before XiaomiUUID
-        #     -3 bytes Xiaomi UUID + ADtype
-        #     -1 byte rssi
-        #     -3+1 bytes sensor type
-        #     -1 byte packet_id
-        #     -6 bytes MAC
-        #     - capability byte offset
-        xdata_length += msg_length - xiaomi_index - 15
-        if xdata_length < 3:
-            return None, None, None
-        xdata_point += xiaomi_index + 14
-        # check if xiaomi data start and length is valid
-        if xdata_length != len(data[xdata_point:-1]):
-            return None, None, None
-        # check encrypted data flags
-        if framectrl & 0x0800:
-            # try to find encryption key for current device
+                "data": True,
+            }
+            binary = False
+            measuring = False
+            # loop through xiaomi payload
+            # assume that the data may have several values of different types,
+            # although I did not notice this behavior with my LYWSDCGQ sensors
+            while True:
+                xvalue_typecode = data[xdata_point:xdata_point + 2]
+                try:
+                    xvalue_length = data[xdata_point + 2]
+                except ValueError as error:
+                    _LOGGER.error("xvalue_length conv. error: %s", error)
+                    _LOGGER.error("xdata_point: %s", xdata_point)
+                    _LOGGER.error("data: %s", data.hex())
+                    result = {}
+                    break
+                except IndexError as error:
+                    _LOGGER.error("Wrong xdata_point: %s", error)
+                    _LOGGER.error("xdata_point: %s", xdata_point)
+                    _LOGGER.error("data: %s", data.hex())
+                    result = {}
+                    break
+                xnext_point = xdata_point + 3 + xvalue_length
+                xvalue = data[xdata_point + 3:xnext_point]
+                resfunc, tbinary, tmeasuring = self._dataobject_dict.get(xvalue_typecode, (None, None, None))
+                if resfunc:
+                    binary = binary or tbinary
+                    measuring = measuring or tmeasuring
+                    result.update(resfunc(xvalue))
+                else:
+                    if self.report_unknown:
+                        _LOGGER.info(
+                            "UNKNOWN dataobject from DEVICE: %s, MAC: %s, ADV: %s",
+                            sensor_type,
+                            ''.join('{:02X}'.format(x) for x in xiaomi_mac_reversed[::-1]),
+                            data.hex()
+                        )
+                if xnext_point > msg_length - 3:
+                    break
+                xdata_point = xnext_point
+            binary = binary and binary_data
+            return result, binary, measuring
+
+        if atc_index != -1:
+            # parse BLE message in ATC format
+
+            # check for BTLE msg size
+            msg_length = data[2] + 3
+            if msg_length != len(data):
+                return None, None, None
+            # check for MAC presence in message and in service data
+            atc_mac = data[atc_index + 3:atc_index + 9]
+            mac_index = atc_index - 1
+            source_mac_reversed = data[mac_index - 7:mac_index - 1]
+            source_mac = source_mac_reversed[::-1]
+            if atc_mac != source_mac:
+                return None, None, None
+            # check for MAC presence in whitelist, if needed
+            if self.discovery is False:
+                if atc_mac not in self.whitelist:
+                    return None, None, None
+            packet_id = data[atc_index + 15]
             try:
-                key = self.aeskeys[xiaomi_mac_reversed]
+                prev_packet = self.lpacket_ids[atc_index]
             except KeyError:
-                # no encryption key found
+                prev_packet = None, None, None
+            if prev_packet == packet_id:
                 return None, None, None
-            nonce = b"".join(
-                [
-                    xiaomi_mac_reversed,
-                    data[xiaomi_index + 5:xiaomi_index + 7],
-                    data[xiaomi_index + 7:xiaomi_index + 8]
+            self.lpacket_ids[atc_index] = packet_id
+            # extract RSSI byte
+            (rssi,) = struct.unpack("<b", data[msg_length - 1:msg_length])
+            # strange positive RSSI workaround
+            if rssi > 0:
+                rssi = -rssi
+            try:
+                sensor_type, binary_data = XIAOMI_TYPE_DICT[
+                    data[atc_index + 1:atc_index + 3]
                 ]
-            )
-            endoffset = msg_length - int(not is_ext_packet)
-            encrypted_payload = data[xdata_point:endoffset]
-            aad = b"\x11"
-            token = encrypted_payload[-4:]
-            payload_counter = encrypted_payload[-7:-4]
-            nonce = b"".join([nonce, payload_counter])
-            cipherpayload = encrypted_payload[:-7]
-            cipher = AES.new(key, AES.MODE_CCM, nonce=nonce, mac_len=4)
-            cipher.update(aad)
-            decrypted_payload = None
-            try:
-                decrypted_payload = cipher.decrypt_and_verify(cipherpayload, token)
-            except ValueError as error:
-                _LOGGER.error("Decryption failed: %s", error)
-                _LOGGER.error("token: %s", token.hex())
-                _LOGGER.error("nonce: %s", nonce.hex())
-                _LOGGER.error("encrypted_payload: %s", encrypted_payload.hex())
-                _LOGGER.error("cipherpayload: %s", cipherpayload.hex())
+            except KeyError:
+                if self.report_unknown:
+                    _LOGGER.info(
+                        "BLE ADV from UNKNOWN ATC SENSOR: RSSI: %s, MAC: %s, ADV: %s",
+                        rssi,
+                        ''.join('{:02X}'.format(x) for x in atc_mac[:]),
+                        data.hex()
+                    )
                 return None, None, None
-            if decrypted_payload is None:
-                _LOGGER.error(
-                    "Decryption failed for %s, decrypted payload is None",
-                    "".join("{:02X}".format(x) for x in xiaomi_mac_reversed[::-1]),
-                )
+            # ATC data length = message length = 6
+            #     -all bytes before ATC UUID
+            #     -3 bytes ATC UUID + ADtype
+            #     -6 bytes MAC
+            #     -1 Frame packet counter
+            #     -1 RSSI
+            xdata_length = msg_length - atc_index - 11
+            if xdata_length < 6:
                 return None, None, None
-            # replace cipher with decrypted data
-            msg_length -= len(encrypted_payload)
-            if is_ext_packet:
-                data = b"".join((data[:xdata_point], decrypted_payload))
-            else:
-                data = b"".join((data[:xdata_point], decrypted_payload, data[-1:]))
-            msg_length += len(decrypted_payload)
-        result = {
-            "rssi": rssi,
-            "mac": ''.join('{:02X}'.format(x) for x in xiaomi_mac_reversed[::-1]),
-            "type": sensor_type,
-            "packet": packet_id,
-            "data": True,
-        }
-        binary = False
-        measuring = False
-        # loop through xiaomi payload
-        # assume that the data may have several values of different types,
-        # although I did not notice this behavior with my LYWSDCGQ sensors
-        while True:
-            xvalue_typecode = data[xdata_point:xdata_point + 2]
-            try:
-                xvalue_length = data[xdata_point + 2]
-            except ValueError as error:
-                _LOGGER.error("xvalue_length conv. error: %s", error)
-                _LOGGER.error("xdata_point: %s", xdata_point)
-                _LOGGER.error("data: %s", data.hex())
-                result = {}
-                break
-            except IndexError as error:
-                _LOGGER.error("Wrong xdata_point: %s", error)
-                _LOGGER.error("xdata_point: %s", xdata_point)
-                _LOGGER.error("data: %s", data.hex())
-                result = {}
-                break
-            xnext_point = xdata_point + 3 + xvalue_length
-            xvalue = data[xdata_point + 3:xnext_point]
+            xdata_point = atc_index + 9
+            # check if atc data start and length is valid
+            if xdata_length != len(data[xdata_point:-2]):
+                return None, None, None
+            result = {
+                "rssi": rssi,
+                "mac": ''.join('{:02X}'.format(x) for x in atc_mac[:]),
+                "type": sensor_type,
+                "packet": packet_id,
+                "data": True,
+            }
+            binary = False
+            measuring = False
+
+            xvalue_typecode = data[atc_index + 1:atc_index + 3]
+            xvalue_length = xdata_length - 2
+            xnext_point = xdata_point + xvalue_length
+            xvalue = data[xdata_point:xnext_point]
             resfunc, tbinary, tmeasuring = self._dataobject_dict.get(xvalue_typecode, (None, None, None))
             if resfunc:
                 binary = binary or tbinary
@@ -737,13 +837,10 @@ class HCIdump(Thread):
             else:
                 if self.report_unknown:
                     _LOGGER.info(
-                        "UNKNOWN dataobject from DEVICE: %s, MAC: %s, ADV: %s",
+                        "UNKNOWN dataobject from ATC DEVICE: %s, MAC: %s, ADV: %s",
                         sensor_type,
-                        ''.join('{:02X}'.format(x) for x in xiaomi_mac_reversed[::-1]),
+                        ''.join('{:02X}'.format(x) for x in atc_mac[:]),
                         data.hex()
                     )
-            if xnext_point > msg_length - 3:
-                break
-            xdata_point = xnext_point
-        binary = binary and binary_data
-        return result, binary, measuring
+            binary = binary and binary_data
+            return result, binary, measuring
